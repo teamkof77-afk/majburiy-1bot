@@ -21,8 +21,11 @@ if (!process.env.BOT_TOKEN || !process.env.MONGO_URI) {
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 
-// 3. MongoDB Sxemalari
-const userSchema = new mongoose.Schema({ userId: Number, name: String });
+// 3. MongoDB Sxemalari (To'g'rilangan va himoyalangan)
+const userSchema = new mongoose.Schema({ 
+    userId: { type: Number, unique: true, required: true }, // Unikal va majburiy qilindi
+    name: String 
+});
 const channelSchema = new mongoose.Schema({ 
     channelId: String, 
     link: String, 
@@ -35,7 +38,11 @@ const Channel = mongoose.model('Channel', channelSchema);
 
 // MongoDB ulanishi
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ MongoDB muvaffaqiyatli ulandi"))
+    .then(async () => {
+        console.log("✅ MongoDB muvaffaqiyatli ulandi");
+        // MUHIM: Bazada null bo'lib qolgan eski buzuq foydalanuvchilarni tozalab tashlaymiz
+        await User.deleteMany({ userId: null }).catch(e => console.log("Tozalashda eski xato yo'q"));
+    })
     .catch(err => console.error("❌ Baza ulanishida xato:", err.message));
 
 let adminState = {};
@@ -46,6 +53,8 @@ async function sleep(ms) {
 }
 
 async function getUnsubscribedChannels(ctx) {
+    if (!ctx.from || !ctx.from.id) return []; // Himoya
+    
     const allChannels = await Channel.find();
     let unsubscribed = [];
 
@@ -56,6 +65,7 @@ async function getUnsubscribedChannels(ctx) {
                 const isMember = ['member', 'administrator', 'creator'].includes(member.status);
                 if (!isMember) unsubscribed.push(ch);
             } catch (e) {
+                // Agar bot kanaldan haydalgan bo'lsa yoki kanal ID xato bo'lsa xato bermaydi
                 unsubscribed.push(ch); 
             }
         } else {
@@ -65,15 +75,24 @@ async function getUnsubscribedChannels(ctx) {
     return unsubscribed;
 }
 
-// 5. Start Buyrug'i
+// 5. Start Buyrug'i (Xavfsiz holatga keltirildi)
 async function sendStart(ctx) {
     try {
+        if (!ctx.from || !ctx.from.id) return; // Telegram'dan ma'lumot kelmasa to'xtatadi
+
         const userId = ctx.from.id;
-        await User.findOneAndUpdate(
-            { userId: userId }, 
-            { name: ctx.from.first_name }, 
-            { upsert: true }
-        );
+        const firstName = ctx.from.first_name || "Foydalanuvchi";
+
+        // Bazaga yozish qismi try-catch bilan o'raldi, unikal kalit xatosi botni o'chira olmaydi
+        try {
+            await User.findOneAndUpdate(
+                { userId: userId }, 
+                { $set: { name: firstName } }, 
+                { upsert: true, new: true }
+            );
+        } catch (mongoErr) {
+            console.error("⚠️ Foydalanuvchini bazaga yozishda chetlab o'tilgan xato:", mongoErr.message);
+        }
 
         if (userId === ADMIN_ID) {
             return ctx.reply("🛠 Admin Panelga xush kelibsiz:", Markup.keyboard([
@@ -85,13 +104,15 @@ async function sendStart(ctx) {
         const unsubbed = await getUnsubscribedChannels(ctx);
 
         if (unsubbed.length === 0) {
-            return ctx.reply(`👋 Xush kelibsiz ${ctx.from.first_name}! Marhamat, kino kodini yuboring.`);
+            return ctx.reply(`👋 Xush kelibsiz ${firstName}! Marhamat, kino kodini yuboring.`);
         } else {
             const buttons = unsubbed.map((l) => [Markup.button.url(l.name, l.link)]);
             buttons.push([Markup.button.callback("✅ Tekshirish", "check_sub")]);
             return ctx.reply("🔴 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:", Markup.inlineKeyboard(buttons));
         }
-    } catch (e) { console.error("Start Error:", e); }
+    } catch (e) { 
+        console.error("Start Error:", e.message); 
+    }
 }
 
 bot.start(sendStart);
@@ -101,11 +122,11 @@ bot.action('check_sub', async (ctx) => {
     try {
         const unsubbed = await getUnsubscribedChannels(ctx);
         if (unsubbed.length === 0) {
-            await ctx.editMessageText("✅ Rahmat! Obuna tasdiqlandi. Endi kod yuborishingiz mumkin.");
+            await ctx.editMessageText("✅ Rahmat! Obuna tasdiqlandi. Endi kod yuborishingiz mumkin.").catch(() => {});
         } else {
-            await ctx.answerCbQuery("❌ Ba'zi kanallarga hali obuna bo'lmagansiz!", { show_alert: true });
+            await ctx.answerCbQuery("❌ Ba'zi kanallarga hali obuna bo'lmagansiz!", { show_alert: true }).catch(() => {});
         }
-    } catch (e) { console.error("Action error:", e); }
+    } catch (e) { console.error("Action error:", e.message); }
 });
 
 // 7. Admin Funksiyalari
@@ -137,9 +158,11 @@ bot.hears('🗑 Linklarni boshqarish', async (ctx) => {
 });
 
 bot.action(/^del_(.+)$/, async (ctx) => {
-    await Channel.findByIdAndDelete(ctx.match[1]);
-    ctx.answerCbQuery("O'chirildi!");
-    ctx.editMessageText("🗑 Link o'chirildi.");
+    try {
+        await Channel.findByIdAndDelete(ctx.match[1]);
+        await ctx.answerCbQuery("O'chirildi!");
+        await ctx.editMessageText("🗑 Link o'chirildi.");
+    } catch (e) { console.error(e.message); }
 });
 
 bot.hears('📢 Xabar yuborish', (ctx) => {
@@ -150,58 +173,68 @@ bot.hears('📢 Xabar yuborish', (ctx) => {
 
 // 8. Xabarlarni qayta ishlash
 bot.on('message', async (ctx) => {
-    const userId = ctx.from.id;
-    const text = ctx.message.text;
+    try {
+        const userId = ctx.from.id;
+        const text = ctx.message.text;
 
-    if (userId === ADMIN_ID && adminState[userId]) {
-        let state = adminState[userId];
-        if (state.step === 'tg_id') { adminState[userId] = { step: 'tg_link', id: text }; return ctx.reply("Linkni yuboring (https://t.me/...):"); }
-        if (state.step === 'tg_link') { 
-            await new Channel({ channelId: state.id, link: text, name: "📢 Kanal", type: 'telegram' }).save(); 
-            delete adminState[userId]; return ctx.reply("✅ Kanal saqlandi!"); 
+        if (userId === ADMIN_ID && adminState[userId]) {
+            let state = adminState[userId];
+            if (state.step === 'tg_id') { adminState[userId] = { step: 'tg_link', id: text }; return ctx.reply("Linkni yuboring (https://t.me/...):"); }
+            if (state.step === 'tg_link') { 
+                await new Channel({ channelId: state.id, link: text, name: "📢 Kanal", type: 'telegram' }).save(); 
+                delete adminState[userId]; return ctx.reply("✅ Kanal saqlandi!"); 
+            }
+            if (state.step === 'ext_name') { adminState[userId] = { step: 'ext_link', name: text }; return ctx.reply("Linkni yuboring:"); }
+            if (state.step === 'ext_link') { 
+                await new Channel({ channelId: 'none', link: text, name: state.name, type: 'external' }).save(); 
+                delete adminState[userId]; return ctx.reply("✅ Tashqi link saqlandi!"); 
+            }
+            
+            if (state.step === 'ad_content') {
+                adminState[userId] = { step: 'ad_btn', msgId: ctx.message.message_id };
+                return ctx.reply("Tugma qo'shilsinmi?", Markup.inlineKeyboard([[Markup.button.callback("✅ Ha", "btn_yes"), Markup.button.callback("❌ Yo'q", "btn_no")]]));
+            }
+            if (state.step === 'ad_btn_data') {
+                const d = text.split('|');
+                if (d.length < 2) return ctx.reply("Format xato! Nomi | Link");
+                broadcast(ctx, state.msgId, Markup.inlineKeyboard([[Markup.button.url(d[0].trim(), d[1].trim())]]));
+                delete adminState[userId]; return;
+            }
         }
-        if (state.step === 'ext_name') { adminState[userId] = { step: 'ext_link', name: text }; return ctx.reply("Linkni yuboring:"); }
-        if (state.step === 'ext_link') { 
-            await new Channel({ channelId: 'none', link: text, name: state.name, type: 'external' }).save(); 
-            delete adminState[userId]; return ctx.reply("✅ Tashqi link saqlandi!"); 
-        }
-        
-        if (state.step === 'ad_content') {
-            adminState[userId] = { step: 'ad_btn', msgId: ctx.message.message_id };
-            return ctx.reply("Tugma qo'shilsinmi?", Markup.inlineKeyboard([[Markup.button.callback("✅ Ha", "btn_yes"), Markup.button.callback("❌ Yo'q", "btn_no")]]));
-        }
-        if (state.step === 'ad_btn_data') {
-            const d = text.split('|');
-            if (d.length < 2) return ctx.reply("Format xato! Nomi | Link");
-            broadcast(ctx, state.msgId, Markup.inlineKeyboard([[Markup.button.url(d[0].trim(), d[1].trim())]]));
-            delete adminState[userId]; return;
-        }
-    }
 
-    if (text && !text.startsWith('/')) {
-        const unsubbed = await getUnsubscribedChannels(ctx);
-        if (unsubbed.length > 0) {
-            const buttons = unsubbed.map((l) => [Markup.button.url(l.name, l.link)]);
-            buttons.push([Markup.button.callback("✅ Tekshirish", "check_sub")]);
-            return ctx.reply("⚠️ Botdan foydalanish uchun kanallarga obuna bo'ling:", Markup.inlineKeyboard(buttons));
+        if (text && !text.startsWith('/')) {
+            const unsubbed = await getUnsubscribedChannels(ctx);
+            if (unsubbed.length > 0) {
+                const buttons = unsubbed.map((l) => [Markup.button.url(l.name, l.link)]);
+                buttons.push([Markup.button.callback("✅ Tekshirish", "check_sub")]);
+                return ctx.reply("⚠️ Botdan foydalanish uchun kanallarga obuna bo'ling:", Markup.inlineKeyboard(buttons));
+            }
+            ctx.reply(`✅ Kod: ${text}. Kino bazadan qidirilmoqda...`);
         }
-        ctx.reply(`✅ Kod: ${text}. Kino bazadan qidirilmoqda...`);
+    } catch (err) {
+        console.error("Xabar qayta ishlashda xato:", err.message);
     }
 });
 
-// 9. Reklama Funksiyasi
+// 9. Reklama Funksiyasi (403 xatosi to'liq ushlandi)
 async function broadcast(ctx, msgId, kb = null) {
     const users = await User.find();
     ctx.reply(`🚀 ${users.length} kishiga yuborish boshlandi...`);
     let count = 0; let blocked = 0;
 
     for (const u of users) {
+        if (!u.userId) continue; // Agar mabodo bazada xato ma'lumot bo'lsa o'tkazib yuboradi
         try { 
             await ctx.telegram.copyMessage(u.userId, ctx.from.id, msgId, kb); 
             count++;
             if (count % 25 === 0) await sleep(1000); 
         } catch (e) {
-            if (e.response && e.response.error_code === 403) blocked++;
+            // Agar foydalanuvchi botni bloklagan bo'lsa xatoni konsolga chiqarmaydi, shunchaki hisoblaydi
+            if (e.response && e.response.error_code === 403) {
+                blocked++;
+            } else {
+                console.error(`Xabar yuborilmadi (${u.userId}):`, e.message);
+            }
         }
     }
     ctx.reply(`✅ Tugatildi!\n✅ Yetkazildi: ${count}\n❌ Bloklagan: ${blocked}`);
@@ -220,7 +253,7 @@ bot.catch((err) => {
     console.error("🔴 Global xato:", err.message);
 });
 
-// Botni ishga tushirish (async/await ishlatilmadi, .then ishlatildi)
+// Botni ishga tushirish
 bot.launch()
     .then(() => console.log("🚀 Bot muvaffaqiyatli ishga tushdi!"))
     .catch((err) => console.error("❌ Bot ishga tushmadi:", err));
